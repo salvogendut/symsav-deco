@@ -60,10 +60,15 @@ _data unsigned char fill_buf[80];
 _data char cfgdat[64];
 _data char init_tmp[64];
 
-// Iterative deco work stack — avoids reliance on SCC call-stack depth for recursion.
-typedef struct { int x; int y; int w; int h; int depth; } DecoItem;
+// Iterative deco work stack — five separate int arrays instead of a struct
+// array so that indexing uses stride=2 (a single shift), which SCC handles
+// reliably.  Stride=10 (struct size) requires a multiply that SCC gets wrong.
 #define DECO_STACK_MAX 32
-_data DecoItem deco_stack[DECO_STACK_MAX];
+_data int stk_x[DECO_STACK_MAX];
+_data int stk_y[DECO_STACK_MAX];
+_data int stk_w[DECO_STACK_MAX];
+_data int stk_h[DECO_STACK_MAX];
+_data int stk_d[DECO_STACK_MAX];
 
 // ---------------------------------------------------------------------------
 // Animation state
@@ -74,7 +79,6 @@ _transfer unsigned char deco_split;      // 0=random, 1=golden
 _transfer int           anim_timer;      // ticks remaining until next redraw
 _transfer int           anim_pause;      // configured pause length in ticks
 _transfer unsigned char anim_stage;      // 0=showing panel, 1=trigger redraw
-_transfer int           deco_stk_top;    // work-stack top index
 
 // ---------------------------------------------------------------------------
 // Screen clear
@@ -122,27 +126,26 @@ static void vram_fill_rect(int x, int y, int w, int h, unsigned char ink)
 
 static void deco_draw(void)
 {
-    int x, y, w, h, depth, wnew, hnew, ink_idx, split;
+    int x, y, w, h, depth, wnew, hnew, ink_idx, do_hsplit, top;
 
-    deco_stack[0].x = 0;
-    deco_stack[0].y = 0;
-    deco_stack[0].w = SCREEN_W;
-    deco_stack[0].h = SCREEN_H;
-    deco_stack[0].depth = 0;
-    deco_stk_top = 1;
+    stk_x[0] = 0;  stk_y[0] = 0;
+    stk_w[0] = SCREEN_W;  stk_h[0] = SCREEN_H;  stk_d[0] = 0;
+    top = 1;
 
-    while (deco_stk_top > 0) {
+    while (top > 0) {
 
-        deco_stk_top--;
-        x     = deco_stack[deco_stk_top].x;
-        y     = deco_stack[deco_stk_top].y;
-        w     = deco_stack[deco_stk_top].w;
-        h     = deco_stack[deco_stk_top].h;
-        depth = deco_stack[deco_stk_top].depth;
+        top--;
+        x     = stk_x[top];
+        y     = stk_y[top];
+        w     = stk_w[top];
+        h     = stk_h[top];
+        depth = stk_d[top];
 
-        if (((rand() % (int)deco_max_depth) < depth) || w < MIN_W || h < MIN_H) {
+        // Leaf condition: too small, or probability threshold reached.
+        // Guard deco_max_depth > 0 prevents division by zero.
+        if (w < MIN_W || h < MIN_H ||
+            (deco_max_depth > 0 && (rand() % (int)deco_max_depth) < depth)) {
 
-            // Leaf: fill interior, leaving BORDER pixels of background as outline.
             ink_idx = rand() % 3;
             vram_fill_rect(x + BORDER,
                            y + BORDER,
@@ -152,56 +155,53 @@ static void deco_draw(void)
 
         } else {
 
-            split = (deco_split == 1) ? (w > h ? 1 : 0) : (rand() & 1);
+            // Decide split axis.
+            if (deco_split == 1) {
+                do_hsplit = (w > h) ? 1 : 0;
+            } else {
+                do_hsplit = rand() & 1;
+            }
 
-            if (split) {
-                // Side-by-side (horizontal) split
+            if (do_hsplit) {
+                // Side-by-side split
                 if (deco_split == 1)
                     wnew = (rand() & 1) ? (w * 38 / 100) : (w * 62 / 100);
                 else
                     wnew = w >> 1;
                 wnew &= ~3;
-                if (wnew < BORDER)          wnew = BORDER;
-                if (wnew > w - BORDER - 4)  wnew = w - BORDER - 4;
+                if (wnew < BORDER + 4)       wnew = BORDER + 4;
+                if (wnew > w - BORDER - 4)   wnew = w - BORDER - 4;
                 wnew &= ~3;
 
-                if (deco_stk_top + 2 <= DECO_STACK_MAX) {
-                    deco_stack[deco_stk_top].x     = x;
-                    deco_stack[deco_stk_top].y     = y;
-                    deco_stack[deco_stk_top].w     = wnew;
-                    deco_stack[deco_stk_top].h     = h;
-                    deco_stack[deco_stk_top].depth = depth + 1;
-                    deco_stk_top++;
-                    deco_stack[deco_stk_top].x     = x + wnew;
-                    deco_stack[deco_stk_top].y     = y;
-                    deco_stack[deco_stk_top].w     = w - wnew;
-                    deco_stack[deco_stk_top].h     = h;
-                    deco_stack[deco_stk_top].depth = depth + 1;
-                    deco_stk_top++;
+                if (top + 2 <= DECO_STACK_MAX) {
+                    stk_x[top] = x;        stk_y[top] = y;
+                    stk_w[top] = wnew;     stk_h[top] = h;
+                    stk_d[top] = depth + 1;
+                    top++;
+                    stk_x[top] = x + wnew; stk_y[top] = y;
+                    stk_w[top] = w - wnew;  stk_h[top] = h;
+                    stk_d[top] = depth + 1;
+                    top++;
                 }
 
             } else {
-                // Top-to-bottom (vertical) split
+                // Top-to-bottom split
                 if (deco_split == 1)
                     hnew = (rand() & 1) ? (h * 38 / 100) : (h * 62 / 100);
                 else
                     hnew = h >> 1;
-                if (hnew < BORDER)          hnew = BORDER;
-                if (hnew > h - BORDER - 1)  hnew = h - BORDER - 1;
+                if (hnew < BORDER + 1)       hnew = BORDER + 1;
+                if (hnew > h - BORDER - 1)   hnew = h - BORDER - 1;
 
-                if (deco_stk_top + 2 <= DECO_STACK_MAX) {
-                    deco_stack[deco_stk_top].x     = x;
-                    deco_stack[deco_stk_top].y     = y;
-                    deco_stack[deco_stk_top].w     = w;
-                    deco_stack[deco_stk_top].h     = hnew;
-                    deco_stack[deco_stk_top].depth = depth + 1;
-                    deco_stk_top++;
-                    deco_stack[deco_stk_top].x     = x;
-                    deco_stack[deco_stk_top].y     = y + hnew;
-                    deco_stack[deco_stk_top].w     = w;
-                    deco_stack[deco_stk_top].h     = h - hnew;
-                    deco_stack[deco_stk_top].depth = depth + 1;
-                    deco_stk_top++;
+                if (top + 2 <= DECO_STACK_MAX) {
+                    stk_x[top] = x;  stk_y[top] = y;
+                    stk_w[top] = w;  stk_h[top] = hnew;
+                    stk_d[top] = depth + 1;
+                    top++;
+                    stk_x[top] = x;       stk_y[top] = y + hnew;
+                    stk_w[top] = w;       stk_h[top] = h - hnew;
+                    stk_d[top] = depth + 1;
+                    top++;
                 }
             }
         }
@@ -398,7 +398,10 @@ void start_animation(void)
     if (split > 1)               split = 0;
     if (speed < 1 || speed > 3) speed = 2;
 
-    deco_max_depth = (depth == 1) ? 4 : (depth == 3) ? 8 : 6;
+    // Original xscreensaver deco uses max_depth=12 as default.
+    // For 320x200 with min_size=20, log2(320/20)=4 halvings reach min width,
+    // so values well above 4 are needed for meaningful subdivision.
+    deco_max_depth = (depth == 1) ? 8 : (depth == 3) ? 16 : 12;
     deco_split     = split;
 
     // Pause ticks between redraws: slow=300, normal=150, fast=60.
