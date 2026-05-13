@@ -70,6 +70,16 @@ _data int stk_w[DECO_STACK_MAX];
 _data int stk_h[DECO_STACK_MAX];
 _data int stk_d[DECO_STACK_MAX];
 
+// Leaf panel staging buffer: deco_plan() fills these; deco_render() draws them.
+// VRAM is only written after we confirm the plan has >= 2 panels, so a
+// degenerate single-colour frame is never visible.
+#define MAX_LEAVES 48
+_data int           lf_x[MAX_LEAVES];
+_data int           lf_y[MAX_LEAVES];
+_data int           lf_w[MAX_LEAVES];
+_data int           lf_h[MAX_LEAVES];
+_data unsigned char lf_ink[MAX_LEAVES];
+
 // ---------------------------------------------------------------------------
 // Animation state
 // ---------------------------------------------------------------------------
@@ -124,8 +134,9 @@ static void vram_fill_rect(int x, int y, int w, int h, unsigned char ink)
 // All splits keep x 4-pixel aligned so vram_fill_rect can address full bytes.
 // ---------------------------------------------------------------------------
 
-// Returns the number of leaf panels drawn.
-static int deco_draw(void)
+// Plan a deco frame: run the subdivision, storing each leaf panel in the
+// lf_* arrays instead of touching VRAM.  Returns the number of leaves found.
+static int deco_plan(void)
 {
     int x, y, w, h, depth, wnew, hnew, ink_idx, do_hsplit, top, leaves;
 
@@ -149,11 +160,13 @@ static int deco_draw(void)
             (deco_max_depth > 0 && (rand() % (int)deco_max_depth) < depth)) {
 
             ink_idx = rand() % 3;
-            vram_fill_rect(x + BORDER,
-                           y + BORDER,
-                           (w - 2 * BORDER) & ~3,
-                           h - 2 * BORDER,
-                           fill_inks[ink_idx]);
+            if (leaves < MAX_LEAVES) {
+                lf_x[leaves]   = x + BORDER;
+                lf_y[leaves]   = y + BORDER;
+                lf_w[leaves]   = (w - 2 * BORDER) & ~3;
+                lf_h[leaves]   = h - 2 * BORDER;
+                lf_ink[leaves] = fill_inks[ink_idx];
+            }
             leaves++;
 
         } else {
@@ -212,15 +225,32 @@ static int deco_draw(void)
     return leaves;
 }
 
-// Clear screen and redraw until at least 2 panels appear (up to 8 attempts).
+// Render the leaf panels stored by the most recent deco_plan() call.
+static void deco_render(int n)
+{
+    int i;
+    if (n > MAX_LEAVES) n = MAX_LEAVES;
+    for (i = 0; i < n; i++)
+        vram_fill_rect(lf_x[i], lf_y[i], lf_w[i], lf_h[i], lf_ink[i]);
+}
+
+// Plan up to 8 times until we get >= 2 panels, then clear + render.
+// VRAM is never written for a degenerate single-colour frame.
 static void deco_draw_checked(void)
 {
     unsigned char tries;
+    int n;
     for (tries = 0; tries < 8; tries++) {
-        vram_clear();
-        if (deco_draw() >= 2)
+        n = deco_plan();
+        if (n >= 2) {
+            vram_clear();
+            deco_render(n);
             return;
+        }
     }
+    // Fallback: render whatever the last plan produced.
+    vram_clear();
+    deco_render(n);
 }
 
 // ---------------------------------------------------------------------------
