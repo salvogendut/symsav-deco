@@ -1,3 +1,4 @@
+![Example Image](deco.png)
 # symsav-deco
 
 A recursive rectangle subdivision screensaver for [SymbOS](https://www.symbos.org/) on the Amstrad CPC.
