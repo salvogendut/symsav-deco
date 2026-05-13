@@ -124,13 +124,15 @@ static void vram_fill_rect(int x, int y, int w, int h, unsigned char ink)
 // All splits keep x 4-pixel aligned so vram_fill_rect can address full bytes.
 // ---------------------------------------------------------------------------
 
-static void deco_draw(void)
+// Returns the number of leaf panels drawn.
+static int deco_draw(void)
 {
-    int x, y, w, h, depth, wnew, hnew, ink_idx, do_hsplit, top;
+    int x, y, w, h, depth, wnew, hnew, ink_idx, do_hsplit, top, leaves;
 
     stk_x[0] = 0;  stk_y[0] = 0;
     stk_w[0] = SCREEN_W;  stk_h[0] = SCREEN_H;  stk_d[0] = 0;
-    top = 1;
+    top    = 1;
+    leaves = 0;
 
     while (top > 0) {
 
@@ -152,6 +154,7 @@ static void deco_draw(void)
                            (w - 2 * BORDER) & ~3,
                            h - 2 * BORDER,
                            fill_inks[ink_idx]);
+            leaves++;
 
         } else {
 
@@ -206,6 +209,18 @@ static void deco_draw(void)
             }
         }
     }
+    return leaves;
+}
+
+// Clear screen and redraw until at least 2 panels appear (up to 8 attempts).
+static void deco_draw_checked(void)
+{
+    unsigned char tries;
+    for (tries = 0; tries < 8; tries++) {
+        vram_clear();
+        if (deco_draw() >= 2)
+            return;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,8 +233,7 @@ static void anim_tick(void)
         if (--anim_timer <= 0)
             anim_stage = 1;
     } else {
-        vram_clear();
-        deco_draw();
+        deco_draw_checked();
         anim_timer = anim_pause;
         anim_stage = 0;
     }
@@ -458,7 +472,7 @@ void start_animation(void)
                   _symbank, (char *)zero_plane, 80u);
 
     // First draw.
-    deco_draw();
+    deco_draw_checked();
     anim_timer = anim_pause;
     anim_stage = 0;
 
