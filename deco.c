@@ -242,7 +242,7 @@ static void deco_draw_checked(void)
     int n;
     for (tries = 0; tries < 8; tries++) {
         n = deco_plan();
-        if (n >= 2) {
+        if (n >= 3) {
             vram_clear();
             deco_render(n);
             return;
