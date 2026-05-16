@@ -3,7 +3,7 @@
 
 SCC="${SCC:-../scc/bin/cc}"
 
-"$SCC" deco.c \
+"$SCC" deco.c deco_msx.s \
     -N "Deco" \
     -o deco.sav \
     -h 512

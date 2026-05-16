@@ -1,7 +1,9 @@
-// deco.c — Deco screensaver for SymbOS
+// deco.c — Deco screensaver for SymbOS (CPC and MSX)
 // Inspired by xscreensaver's "deco" (Jamie Zawinski, 1997) — recursive
 // rectangle subdivision filling the screen with coloured panels.
-// Renders directly to CPC Mode 1 VRAM via Bank_Copy.
+//
+// CPC: renders to Mode 1 VRAM (320x200, 4 inks) via Bank_Copy.
+// MSX: renders to Screen 7 VRAM (512x212, 16 colors) via VDP ports.
 // SymbOS C port by Salvatore Bognanni
 
 #include <symbos.h>
@@ -15,11 +17,17 @@
 #define MSC_SAV_CONFIG 3
 #define MSR_SAV_CONFIG 4
 
-#define SCREEN_W  320
-#define SCREEN_H  200
+// CPC Mode 1 — 320x200, 4 inks, 4px per byte
+#define SCREEN_W_CPC  320
+#define SCREEN_H_CPC  200
 
-// Border thickness in pixels (must be a multiple of 4 — equals one Mode-1 byte).
-// The background colour (ink1 = black) shows through as the panel border.
+// MSX Screen 7 — 512x212, 16 colors, 2px per byte (4bpp nibble)
+#define SCREEN_W_MSX  512
+#define SCREEN_H_MSX  212
+
+// Border: 4px gap between panels (background ink shows through).
+// Must be a multiple of 4 so x stays 4-pixel aligned on CPC (1 Mode-1 byte)
+// and 2-pixel aligned on MSX (1 Screen-7 byte).
 #define BORDER    4
 
 // Minimum panel size before recursion stops regardless of depth.
@@ -27,12 +35,11 @@
 #define MIN_H     20
 
 // ---------------------------------------------------------------------------
-// CPC Mode-1 VRAM
+// CPC Mode-1 VRAM encoding
 //
 // Byte layout for 4 consecutive pixels p0..p3 (ink 0-3):
 //   bit7=p0_lo  bit6=p1_lo  bit5=p2_lo  bit4=p3_lo
 //   bit3=p0_hi  bit2=p1_hi  bit1=p2_hi  bit0=p3_hi
-//   ink: lo = bit0(ink), hi = bit1(ink)
 //
 // SymbOS default Mode-1 palette:
 //   ink0 = white  -> 0x00
@@ -43,8 +50,32 @@
 
 static const unsigned char ink_byte[4] = { 0x00, 0xF0, 0x0F, 0xFF };
 
-// Three panel fill inks cycling across leaf rectangles.
+// CPC fill inks: indices into ink_byte[] used for leaf panels.
 static const unsigned char fill_inks[3] = { 3, 0, 2 };   // bright, white, dim
+
+// ---------------------------------------------------------------------------
+// MSX Screen 7 color encoding
+//
+// Each byte holds 2 pixels as 4-bit nibbles: high = left pixel, low = right.
+// Nibble value = SymbOS color index (1=black background, 8=white, ...).
+// A solid fill byte = (color << 4) | color.
+//
+// Fill colors — vibrant set from the 16-color MSX palette:
+//   0x8 = COLOR_WHITE,  0x9 = COLOR_GREEN,   0xA = COLOR_LGREEN,
+//   0xB = COLOR_LRED,   0xC = COLOR_YELLOW,  0xD = COLOR_GRAY,
+//   0xE = COLOR_LCYAN,  0xF = COLOR_LBLUE
+// ---------------------------------------------------------------------------
+
+#define MSX_BG      0x1   // black (border / background)
+#define MSX_NCOLORS 8
+
+static const unsigned char msx_fill_inks[8] = {
+    0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF
+};
+
+// VDP fill routine (deco_msx.s): fills len bytes of MSX VRAM at vram_addr.
+extern void vdp_fill(unsigned int vram_addr, unsigned char fill_byte,
+                     unsigned short len);
 
 // ---------------------------------------------------------------------------
 // Data-segment buffers
@@ -81,6 +112,20 @@ _data int           lf_h[MAX_LEAVES];
 _data unsigned char lf_ink[MAX_LEAVES];
 
 // ---------------------------------------------------------------------------
+// Platform state
+// ---------------------------------------------------------------------------
+
+// Set at animation start via Sys_Type(); 0=CPC, 1=MSX.
+_transfer char          is_msx = 0;
+
+// Runtime screen dimensions (set from SCREEN_W/H_CPC or _MSX at startup).
+_transfer int           scr_w;
+_transfer int           scr_h;
+
+// Number of fill inks available on the current platform (3 for CPC, 8 for MSX).
+_transfer unsigned char deco_ninks;
+
+// ---------------------------------------------------------------------------
 // Animation state
 // ---------------------------------------------------------------------------
 
@@ -97,10 +142,15 @@ _transfer unsigned char anim_stage;      // 0=showing panel, 1=trigger redraw
 static void vram_clear(void)
 {
     unsigned char k;
-    for (k = 0; k < 8; k++) {
-        Bank_Copy(0,
-            (char *)(0xC000u + (unsigned short)k * 0x0800u),
-            _symbank, (char *)zero_plane, 2000u);
+    if (is_msx) {
+        // Screen 7: 212 rows x 256 bytes/row = 54272 bytes; ink1+ink1 = 0x11
+        vdp_fill(0u, 0x11u, 54272u);
+    } else {
+        for (k = 0; k < 8; k++) {
+            Bank_Copy(0,
+                (char *)(0xC000u + (unsigned short)k * 0x0800u),
+                _symbank, (char *)zero_plane, 2000u);
+        }
     }
 }
 
@@ -112,20 +162,33 @@ static void vram_clear(void)
 static void vram_fill_rect(int x, int y, int w, int h, unsigned char ink)
 {
     unsigned short addr;
+    unsigned int   msx_addr;
+    unsigned char  fill_byte;
     int row, bx, bw;
 
-    bx = x >> 2;
-    bw = w >> 2;
-    if (bw <= 0 || h <= 0) return;
-
-    memset(fill_buf, ink_byte[ink & 3], (unsigned short)bw);
-
-    for (row = y; row < y + h; row++) {
-        addr = 0xC000u
-             + (unsigned short)(row >> 3) * 80u
-             + (unsigned short)(row &  7) * 0x0800u
-             + (unsigned short)bx;
-        Bank_Copy(0, (char *)addr, _symbank, (char *)fill_buf, (unsigned short)bw);
+    if (is_msx) {
+        // Screen 7: 2px per byte; each row is 256 bytes; VRAM is linear.
+        bx = x >> 1;
+        bw = w >> 1;
+        if (bw <= 0 || h <= 0) return;
+        fill_byte = (unsigned char)((ink << 4) | ink);
+        for (row = y; row < y + h; row++) {
+            msx_addr = (unsigned int)row * 256u + (unsigned int)bx;
+            vdp_fill(msx_addr, fill_byte, (unsigned short)bw);
+        }
+    } else {
+        // CPC Mode 1: 4px per byte; VRAM is interleaved across 8 planes.
+        bx = x >> 2;
+        bw = w >> 2;
+        if (bw <= 0 || h <= 0) return;
+        memset(fill_buf, ink_byte[ink & 3], (unsigned short)bw);
+        for (row = y; row < y + h; row++) {
+            addr = 0xC000u
+                 + (unsigned short)(row >> 3) * 80u
+                 + (unsigned short)(row &  7) * 0x0800u
+                 + (unsigned short)bx;
+            Bank_Copy(0, (char *)addr, _symbank, (char *)fill_buf, (unsigned short)bw);
+        }
     }
 }
 
@@ -141,7 +204,7 @@ static int deco_plan(void)
     int x, y, w, h, depth, wnew, hnew, ink_idx, do_hsplit, top, leaves;
 
     stk_x[0] = 0;  stk_y[0] = 0;
-    stk_w[0] = SCREEN_W;  stk_h[0] = SCREEN_H;  stk_d[0] = 0;
+    stk_w[0] = scr_w;  stk_h[0] = scr_h;  stk_d[0] = 0;
     top    = 1;
     leaves = 0;
 
@@ -159,13 +222,14 @@ static int deco_plan(void)
         if (w < MIN_W || h < MIN_H ||
             (deco_max_depth > 0 && (rand() % (int)deco_max_depth) < depth)) {
 
-            ink_idx = rand() % 3;
+            ink_idx = rand() % (int)deco_ninks;
             if (leaves < MAX_LEAVES) {
                 lf_x[leaves]   = x + BORDER;
                 lf_y[leaves]   = y + BORDER;
                 lf_w[leaves]   = (w - 2 * BORDER) & ~3;
                 lf_h[leaves]   = h - 2 * BORDER;
-                lf_ink[leaves] = fill_inks[ink_idx];
+                lf_ink[leaves] = is_msx ? msx_fill_inks[ink_idx]
+                                        : fill_inks[ink_idx];
             }
             leaves++;
 
@@ -442,9 +506,22 @@ void start_animation(void)
     if (split > 1)               split = 0;
     if (speed < 1 || speed > 3) speed = 2;
 
+    // Detect platform and set runtime screen geometry.
+    is_msx = ((Sys_Type() & TYPE_MSX) != 0) ? 1 : 0;
+    if (is_msx) {
+        scr_w      = SCREEN_W_MSX;
+        scr_h      = SCREEN_H_MSX;
+        deco_ninks = MSX_NCOLORS;
+    } else {
+        scr_w      = SCREEN_W_CPC;
+        scr_h      = SCREEN_H_CPC;
+        deco_ninks = 3;
+    }
+
     // Original xscreensaver deco uses max_depth=12 as default.
     // For 320x200 with min_size=20, log2(320/20)=4 halvings reach min width,
     // so values well above 4 are needed for meaningful subdivision.
+    // Same values serve MSX well (512x212 is proportionally similar).
     deco_max_depth = (depth == 1) ? 8 : (depth == 3) ? 16 : 12;
     deco_split     = split;
 
@@ -463,8 +540,8 @@ void start_animation(void)
     anim_ctrl[0].param  = AREA_16COLOR | COLOR_BLACK;
     anim_ctrl[0].x      = 0;
     anim_ctrl[0].y      = 0;
-    anim_ctrl[0].w      = SCREEN_W;
-    anim_ctrl[0].h      = SCREEN_H;
+    anim_ctrl[0].w      = scr_w;
+    anim_ctrl[0].h      = scr_h;
     anim_ctrl[0].unused = 0;
 
     memset(&anim_cg, 0, sizeof(anim_cg));
@@ -476,14 +553,14 @@ void start_animation(void)
     anim_win.state    = WIN_NORMAL;
     anim_win.flags    = WIN_NOTTASKBAR | WIN_NOTMOVEABLE;
     anim_win.pid      = _sympid;
-    anim_win.w        = SCREEN_W;
-    anim_win.h        = SCREEN_H;
-    anim_win.wfull    = SCREEN_W;
-    anim_win.hfull    = SCREEN_H;
+    anim_win.w        = scr_w;
+    anim_win.h        = scr_h;
+    anim_win.wfull    = scr_w;
+    anim_win.hfull    = scr_h;
     anim_win.wmin     = 32;
     anim_win.hmin     = 24;
-    anim_win.wmax     = SCREEN_W;
-    anim_win.hmax     = SCREEN_H;
+    anim_win.wmax     = scr_w;
+    anim_win.hmax     = scr_h;
     anim_win.title    = empty_str;
     anim_win.status   = empty_str;
     anim_win.controls = &anim_cg;
@@ -494,12 +571,15 @@ void start_animation(void)
     desktop_stop((unsigned char)wid);
     vram_clear();
 
-    // One Idle() to flush any deferred system VRAM writes; then re-clear the
-    // bottom char row (y=192-199) which the taskbar clock may have touched.
-    Idle();
-    for (b = 0; b < 8; b++)
-        Bank_Copy(0, (char *)(0xC000u + (unsigned short)b * 0x0800u + 1920u),
-                  _symbank, (char *)zero_plane, 80u);
+    // CPC only: one Idle() to flush any deferred system VRAM writes, then
+    // re-clear the bottom char row (y=192-199) which the taskbar clock may
+    // have touched.
+    if (!is_msx) {
+        Idle();
+        for (b = 0; b < 8; b++)
+            Bank_Copy(0, (char *)(0xC000u + (unsigned short)b * 0x0800u + 1920u),
+                      _symbank, (char *)zero_plane, 80u);
+    }
 
     // First draw.
     deco_draw_checked();
@@ -535,9 +615,11 @@ void start_animation(void)
         anim_tick();
 
         Idle();
-        for (b = 0; b < 8; b++)
-            Bank_Copy(0, (char *)(0xC000u + (unsigned short)b * 0x0800u + 1920u),
-                      _symbank, (char *)zero_plane, 80u);
+        if (!is_msx) {
+            for (b = 0; b < 8; b++)
+                Bank_Copy(0, (char *)(0xC000u + (unsigned short)b * 0x0800u + 1920u),
+                          _symbank, (char *)zero_plane, 80u);
+        }
     }
 }
 
